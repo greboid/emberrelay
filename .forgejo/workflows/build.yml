@@ -23,7 +23,7 @@ jobs:
       - uses: actions/toolkit/git-checkout@master
       - uses: actions/toolkit/docker-login@master
         with:
-          audience: u:1:37f6dfce-654c-486d-97be-c9faffacca15
+          audience: u:1:6d868e43-1af3-45d3-8dc9-0a4377c0c94a
           ghcr: ${{ secrets.GHCR_TOKEN }}
       - uses: actions/toolkit/docker-push@master
         with:
