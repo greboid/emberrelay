@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type fjUser struct {
@@ -37,6 +38,12 @@ func (i fjIssue) merged() bool {
 type fjComment struct {
 	Body string `json:"body"`
 	User fjUser `json:"user"`
+}
+
+type fjTimelineEvent struct {
+	Type         string    `json:"type"`
+	RefCommitSHA string    `json:"ref_commit_sha"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type mirroredRepo struct {
@@ -133,6 +140,10 @@ func (f *forgejo) editIssue(ctx context.Context, r repoRef, number int, fields m
 
 func (f *forgejo) listComments(ctx context.Context, r repoRef, number int) ([]fjComment, error) {
 	return list[fjComment](ctx, f.api, fmt.Sprintf("/repos/%s/issues/%d/comments", r, number))
+}
+
+func (f *forgejo) listTimeline(ctx context.Context, r repoRef, number int) ([]fjTimelineEvent, error) {
+	return list[fjTimelineEvent](ctx, f.api, fmt.Sprintf("/repos/%s/issues/%d/timeline", r, number))
 }
 
 func (f *forgejo) createComment(ctx context.Context, r repoRef, number int, body string) error {

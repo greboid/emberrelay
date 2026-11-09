@@ -93,6 +93,18 @@ func (g *gitHub) getItem(ctx context.Context, r repoRef, number int) (ghItem, er
 	return item, err
 }
 
+func (g *gitHub) closeIssue(ctx context.Context, r repoRef, number int) error {
+	in := map[string]string{"state": stateClosed}
+	_, err := g.api.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/%d", r, number), in, nil)
+	return err
+}
+
+func (g *gitHub) createComment(ctx context.Context, r repoRef, number int, body string) error {
+	in := map[string]string{"body": body}
+	_, err := g.api.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", r, number), in, nil)
+	return err
+}
+
 // listComments returns conversation comments and, for pull requests, reviews
 // and inline review comments, oldest first.
 func (g *gitHub) listComments(ctx context.Context, r repoRef, number int, isPull bool) ([]ghComment, error) {

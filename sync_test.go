@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -96,6 +97,7 @@ type fakeIssue struct {
 type fakeForgejo struct {
 	issues   map[int]*fakeIssue
 	comments map[int][]fjComment
+	timeline map[int][]fjTimelineEvent
 	next     int
 }
 
@@ -153,6 +155,9 @@ func (f *fakeForgejo) handler(t *testing.T) http.Handler {
 		f.comments[number(r)] = append(f.comments[number(r)], fjComment{Body: decode(r)["body"], User: fjUser{"bot"}})
 		reply(w, map[string]any{})
 	})
+	mux.HandleFunc("GET /repos/o/r/issues/{n}/timeline", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, append([]fjTimelineEvent{}, f.timeline[number(r)]...))
+	})
 	return mux
 }
 
@@ -161,6 +166,8 @@ type fakeGitHub struct {
 	pulls    []map[string]any
 	comments map[int][]map[string]any
 	single   map[int]map[string]any
+	closed   []int
+	posted   map[int][]string
 }
 
 func (g *fakeGitHub) handler() http.Handler {
@@ -180,9 +187,25 @@ func (g *fakeGitHub) handler() http.Handler {
 		}
 		reply(w, item)
 	})
+	mux.HandleFunc("PATCH /repos/o/r/issues/{n}", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("n"))
+		g.closed = append(g.closed, n)
+		g.issues = slices.DeleteFunc(g.issues, func(i map[string]any) bool { return i["number"] == n })
+		closed := ghIssueJSON(n, "Bug")
+		closed["state"] = stateClosed
+		g.single[n] = closed
+		reply(w, closed)
+	})
 	mux.HandleFunc("GET /repos/o/r/issues/{n}/comments", func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.PathValue("n"))
 		reply(w, append([]map[string]any{}, g.comments[n]...))
+	})
+	mux.HandleFunc("POST /repos/o/r/issues/{n}/comments", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("n"))
+		var in map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		g.posted[n] = append(g.posted[n], in["body"])
+		reply(w, map[string]any{})
 	})
 	mux.HandleFunc("GET /repos/o/r/pulls/{n}/reviews", func(w http.ResponseWriter, _ *http.Request) {
 		reply(w, []map[string]any{{"id": 7, "state": "PENDING", "body": "x"}, {"id": 8, "state": "APPROVED", "body": "lgtm", "submitted_at": time.Now()}})
@@ -208,8 +231,8 @@ func (p *fakePusher) push(_ context.Context, req pushRequest) error {
 }
 
 func newHarness(t *testing.T) (*syncer, *fakeGitHub, *fakeForgejo, *fakePusher, mirroredRepo) {
-	gh := &fakeGitHub{comments: map[int][]map[string]any{}, single: map[int]map[string]any{}}
-	fj := &fakeForgejo{issues: map[int]*fakeIssue{}, comments: map[int][]fjComment{}, next: 40}
+	gh := &fakeGitHub{comments: map[int][]map[string]any{}, single: map[int]map[string]any{}, posted: map[int][]string{}}
+	fj := &fakeForgejo{issues: map[int]*fakeIssue{}, comments: map[int][]fjComment{}, timeline: map[int][]fjTimelineEvent{}, next: 40}
 	ghSrv := httptest.NewServer(gh.handler())
 	fjSrv := httptest.NewServer(http.StripPrefix("/api/v1", fj.handler(t)))
 	t.Cleanup(ghSrv.Close)
@@ -331,6 +354,9 @@ func TestMergedPullIsNotPushed(t *testing.T) {
 	if len(p.requests) != 0 || issue.State != stateClosed {
 		t.Errorf("requests = %+v, state = %s", p.requests, issue.State)
 	}
+	if len(gh.closed) != 0 {
+		t.Errorf("closed on GitHub: %v", gh.closed)
+	}
 }
 
 func TestCloseAndReopen(t *testing.T) {
@@ -361,17 +387,99 @@ func TestCloseAndReopen(t *testing.T) {
 	}
 }
 
-func TestClosedOnForgejoOnlyStaysClosed(t *testing.T) {
+func TestClosedOnForgejoClosesGitHub(t *testing.T) {
 	s, gh, fj, _, r := newHarness(t)
 	issue := fj.add("Bug", marker{Number: 5, State: stateOpen}.String()+"\n\nx", nil)
 	issue.State = stateClosed
 	gh.issues = []map[string]any{ghIssueJSON(5, "Bug")}
+	gh.comments[5] = []map[string]any{{"id": 11, "body": "last word", "user": map[string]any{"login": "bob"}, "created_at": time.Now()}}
+
+	for range 2 {
+		if err := s.syncRepo(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !slices.Equal(gh.closed, []int{5}) {
+		t.Errorf("closed on GitHub: %v", gh.closed)
+	}
+	if m, _ := parseMarker(issue.Body); issue.State != stateClosed || m.State != stateClosed {
+		t.Errorf("state = %s, marker = %v", issue.State, m)
+	}
+	if got := len(fj.comments[issue.Number]); got != 1 {
+		t.Errorf("got %d comments", got)
+	}
+	if len(gh.posted[5]) != 0 {
+		t.Errorf("posted = %v", gh.posted[5])
+	}
+
+	gh.issues = []map[string]any{ghIssueJSON(5, "Bug")}
+	if err := s.syncRepo(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if issue.State != stateOpen || len(gh.closed) != 1 {
+		t.Errorf("state = %s, closed on GitHub: %v", issue.State, gh.closed)
+	}
+}
+
+func TestClosedByCommitIsLinkedOnGitHub(t *testing.T) {
+	s, gh, fj, _, r := newHarness(t)
+	issue := fj.add("Bug", marker{Number: 5, State: stateOpen}.String()+"\n\nx", nil)
+	issue.State = stateClosed
+	now := time.Now()
+	fj.timeline[issue.Number] = []fjTimelineEvent{
+		{Type: "commit_ref", RefCommitSHA: "abc123", CreatedAt: now},
+		{Type: "close", CreatedAt: now},
+	}
+	gh.issues = []map[string]any{ghIssueJSON(5, "Bug")}
+
+	for range 2 {
+		if err := s.syncRepo(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"Closed by https://github.com/o/r/commit/abc123"}
+	if !slices.Equal(gh.posted[5], want) {
+		t.Errorf("posted = %v", gh.posted[5])
+	}
+}
+
+func TestClosingCommit(t *testing.T) {
+	now := time.Now()
+	ref := fjTimelineEvent{Type: "commit_ref", RefCommitSHA: "abc", CreatedAt: now}
+	at := func(typ string, d time.Duration) fjTimelineEvent {
+		return fjTimelineEvent{Type: typ, CreatedAt: now.Add(d)}
+	}
+	tests := []struct {
+		name   string
+		events []fjTimelineEvent
+		want   string
+	}{
+		{"none", nil, ""},
+		{"closed by commit", []fjTimelineEvent{ref, at("close", 0)}, "abc"},
+		{"closed later by hand", []fjTimelineEvent{ref, at("close", time.Hour)}, ""},
+		{"reference only", []fjTimelineEvent{ref}, ""},
+		{"comment between", []fjTimelineEvent{ref, at("comment", 0), at("close", 0)}, ""},
+		{"reclosed by hand", []fjTimelineEvent{ref, at("close", 0), at("reopen", time.Hour), at("close", time.Hour)}, ""},
+		{"reference after close", []fjTimelineEvent{at("close", -time.Hour), ref}, ""},
+	}
+	for _, tt := range tests {
+		if got := closingCommit(tt.events); got != tt.want {
+			t.Errorf("%s: closingCommit = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestClosedPullOnForgejoStaysOpenOnGitHub(t *testing.T) {
+	s, gh, fj, p, r := newHarness(t)
+	issue := fj.add("A pull", marker{Number: 6, State: stateOpen, Head: "aaa"}.String()+"\n\nx", map[string]any{"merged": false})
+	issue.State = stateClosed
+	gh.pulls = []map[string]any{ghPullJSON(6, "aaa")}
 
 	if err := s.syncRepo(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
-	if issue.State != stateClosed {
-		t.Error("issue was reopened")
+	if len(gh.closed) != 0 || len(p.requests) != 0 || issue.State != stateClosed {
+		t.Errorf("closed on GitHub: %v, requests = %+v, state = %s", gh.closed, p.requests, issue.State)
 	}
 }
 

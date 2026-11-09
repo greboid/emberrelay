@@ -10,11 +10,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
 	stateOpen   = "open"
 	stateClosed = "closed"
+
+	closingCommitWindow = time.Minute
 )
 
 // Markers are anchored to the start of the body so that text copied from
@@ -241,6 +244,10 @@ func (s *syncer) syncOpen(ctx context.Context, r mirroredRepo, item ghItem, item
 		s.log.Info("copied item", "repo", r.forgejo, "github", item.Number, "forgejo", t.issue.Number)
 	}
 
+	if !item.isPull() && t.marker.State == stateOpen && t.issue.State == stateClosed {
+		return s.closeOnGitHub(ctx, r, item, t)
+	}
+
 	next := t.marker
 	next.State = stateOpen
 	// Pushing to a merged or closed AGit pull request would create a new one.
@@ -265,7 +272,8 @@ func (s *syncer) syncOpen(ctx context.Context, r mirroredRepo, item ghItem, item
 	} else if next != t.marker {
 		fields["body"] = withMarker(t.issue.Body, next)
 	}
-	// Only reopen on a GitHub reopen, so closing on Forgejo alone is respected.
+	// Only reopen on a GitHub reopen, so closing a pull request on Forgejo alone
+	// is respected.
 	if t.marker.State == stateClosed && t.issue.State == stateClosed && !t.issue.merged() {
 		fields["state"] = stateOpen
 	}
@@ -334,6 +342,50 @@ func (s *syncer) syncClosed(ctx context.Context, r mirroredRepo, t tracked) erro
 	}
 	s.log.Info("closing item", "repo", r.forgejo, "github", t.marker.Number, "forgejo", t.issue.Number)
 	return s.fj.editIssue(ctx, r.forgejo, t.issue.Number, fields)
+}
+
+// closingCommit returns the commit that caused the latest close, if any. The
+// close event has no SHA of its own; Forgejo records a commit_ref immediately
+// before it.
+func closingCommit(events []fjTimelineEvent) string {
+	for i := len(events) - 1; i > 0; i-- {
+		if events[i].Type != "close" {
+			continue
+		}
+		prev := events[i-1]
+		if prev.Type == "commit_ref" && events[i].CreatedAt.Sub(prev.CreatedAt) <= closingCommitWindow {
+			return prev.RefCommitSHA
+		}
+		return ""
+	}
+	return ""
+}
+
+func (s *syncer) closeOnGitHub(ctx context.Context, r mirroredRepo, item ghItem, t tracked) error {
+	if err := s.syncComments(ctx, r, item.Number, t.issue.Number, false); err != nil {
+		return err
+	}
+	events, err := s.fj.listTimeline(ctx, r.forgejo, t.issue.Number)
+	if err != nil {
+		s.log.Warn("unable to read issue timeline", "repo", r.forgejo, "forgejo", t.issue.Number, "error", err)
+	}
+
+	s.log.Info("closing GitHub issue", "repo", r.forgejo, "github", item.Number, "forgejo", t.issue.Number)
+	if err := s.gh.closeIssue(ctx, r.github, item.Number); err != nil {
+		return err
+	}
+	// Posted after closing so that a failed close cannot duplicate the comment
+	// on the next poll.
+	if sha := closingCommit(events); sha != "" {
+		body := fmt.Sprintf("Closed by https://github.com/%s/commit/%s", r.github, sha)
+		if err := s.gh.createComment(ctx, r.github, item.Number, body); err != nil {
+			s.log.Warn("unable to comment on GitHub issue", "repo", r.github, "github", item.Number, "error", err)
+		}
+	}
+
+	next := t.marker
+	next.State = stateClosed
+	return s.fj.editIssue(ctx, r.forgejo, t.issue.Number, map[string]string{"body": withMarker(t.issue.Body, next)})
 }
 
 func (s *syncer) syncComments(ctx context.Context, r mirroredRepo, number, index int, isPull bool) error {
