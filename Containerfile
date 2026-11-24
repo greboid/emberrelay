@@ -4,7 +4,7 @@ WORKDIR /app
 COPY . /app
 RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-extldflags "-static"' -trimpath -ldflags=-buildid= -o main .
 
-FROM alpine:3.24 as secret-env
+FROM alpine:3.24.4 as secret-env
 
 ARG SECRET_ENV_TAG="v0.1.0"
 
