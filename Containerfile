@@ -15,7 +15,6 @@ RUN RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --locked
 
 FROM ghcr.io/greboid/dockerfiles/base
 
-# secret-env runs as /emberrelay, loads /run/secrets/* into the environment, then execs the real binary
 COPY --from=builder /app/main /usr/libexec/emberrelay.real
 COPY --from=secret-env /src/target/release/secret-env /emberrelay
 COPY secret-env.conf /etc/secret-env/emberrelay.conf
